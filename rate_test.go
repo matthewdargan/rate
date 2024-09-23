@@ -5,6 +5,7 @@
 package rate_test
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -115,5 +116,16 @@ func TestSimultaneousRequests(t *testing.T) {
 	nOK := numOK.Load()
 	if nOK != burst {
 		t.Errorf("numOK = %d, want %d", nOK, burst)
+	}
+}
+
+func TestZeroLimit(t *testing.T) {
+	t.Parallel()
+	var l rate.Limiter
+	if !l.Allow() {
+		t.Error("lim.Allow() = false, want true")
+	}
+	if !l.AllowN(time.Now(), math.MaxUint32) {
+		t.Error("lim.AllowN(time.Now(), math.MaxUint32) = false, want true")
 	}
 }
