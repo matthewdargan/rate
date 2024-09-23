@@ -5,6 +5,8 @@
 package rate_test
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,4 +88,32 @@ func TestLimiterJumpBackwards(t *testing.T) {
 		{t2, 1, false},
 		{t2, 1, false},
 	})
+}
+
+func TestSimultaneousRequests(t *testing.T) {
+	t.Parallel()
+	const (
+		burst = 5
+		n     = 15
+	)
+	var (
+		wg    sync.WaitGroup
+		numOK atomic.Uint32
+	)
+	lim := rate.NewLimiter(1, burst)
+	f := func() {
+		defer wg.Done()
+		if ok := lim.Allow(); ok {
+			numOK.Add(1)
+		}
+	}
+	wg.Add(n)
+	for range n {
+		go f()
+	}
+	wg.Wait()
+	nOK := numOK.Load()
+	if nOK != burst {
+		t.Errorf("numOK = %d, want %d", nOK, burst)
+	}
 }
