@@ -5,6 +5,7 @@
 package rate_test
 
 import (
+	"context"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -101,10 +102,10 @@ func TestSimultaneousRequests(t *testing.T) {
 		wg    sync.WaitGroup
 		numOK atomic.Uint32
 	)
-	lim := rate.NewLimiter(1, burst)
+	l := rate.NewLimiter(1, burst)
 	f := func() {
 		defer wg.Done()
-		if ok := lim.Allow(); ok {
+		if ok := l.Allow(); ok {
 			numOK.Add(1)
 		}
 	}
@@ -123,9 +124,31 @@ func TestZeroLimit(t *testing.T) {
 	t.Parallel()
 	var l rate.Limiter
 	if !l.Allow() {
-		t.Error("lim.Allow() = false, want true")
+		t.Error("l.Allow() = false, want true")
 	}
 	if !l.AllowN(time.Now(), math.MaxUint32) {
-		t.Error("lim.AllowN(time.Now(), math.MaxUint32) = false, want true")
+		t.Error("l.AllowN(time.Now(), math.MaxUint32) = false, want true")
+	}
+}
+
+func BenchmarkAllowN(b *testing.B) {
+	l := rate.NewLimiter(1, 1)
+	now := time.Now()
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			l.AllowN(now, 1)
+		}
+	})
+}
+
+func BenchmarkWaitNNoDelay(b *testing.B) {
+	l := rate.NewLimiter(float64(b.N), uint(b.N))
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = l.WaitN(ctx, time.Now(), 1)
 	}
 }
