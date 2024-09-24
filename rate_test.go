@@ -7,6 +7,7 @@ package rate_test
 import (
 	"context"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -117,6 +118,87 @@ func TestSimultaneousRequests(t *testing.T) {
 	nOK := numOK.Load()
 	if nOK != burst {
 		t.Errorf("numOK = %d, want %d", nOK, burst)
+	}
+}
+
+type testTime struct {
+	mu     sync.Mutex
+	cur    time.Time
+	timers []testTimer
+}
+
+type testTimer struct {
+	when time.Time
+	ch   chan<- time.Time
+}
+
+func (tt *testTime) now() time.Time {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	return tt.cur
+}
+
+func (tt *testTime) since(t time.Time) time.Duration {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	return tt.cur.Sub(t)
+}
+
+func (tt *testTime) advance(d time.Duration) {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	tt.advanceUnlocked(d)
+}
+
+func (tt *testTime) advanceUnlocked(d time.Duration) {
+	tt.cur = tt.cur.Add(d)
+	for i := 0; i < len(tt.timers); {
+		if tt.timers[i].when.After(tt.cur) {
+			i++
+			continue
+		}
+		tt.timers[i].ch <- tt.cur
+		tt.timers = slices.Delete(tt.timers, i, i+1)
+	}
+}
+
+func newTestTime() *testTime {
+	return &testTime{cur: time.Now()}
+}
+
+func TestLongRunningQPS(t *testing.T) {
+	// The test runs for a few (fake) seconds executing many requests
+	// and checks that overall number of requests is reasonable.
+	t.Parallel()
+	const (
+		limit = 100
+		burst = 100
+	)
+	var (
+		numOK atomic.Uint32
+		tt    = newTestTime()
+	)
+	l := rate.NewLimiter(limit, burst)
+	start := tt.now()
+	end := start.Add(5 * time.Second)
+	for tt.now().Before(end) {
+		if ok := l.AllowN(tt.now(), 1); ok {
+			numOK.Add(1)
+		}
+		// This will still offer ~500 requests per second, but won't consume
+		// outrageous amount of CPU.
+		tt.advance(2 * time.Millisecond)
+	}
+	elapsed := tt.since(start)
+	ideal := burst + (limit * float64(elapsed) / float64(time.Second))
+	// We should never get more requests than allowed.
+	nOK := numOK.Load()
+	if want := uint32(ideal + 1); nOK > want {
+		t.Errorf("numOK = %d, want %d (ideal %f)", nOK, want, ideal)
+	}
+	// We should get very close to the number of requests allowed.
+	if want := uint32(0.999 * ideal); nOK < want {
+		t.Errorf("numOK = %d, want %d (ideal %f)", nOK, want, ideal)
 	}
 }
 
