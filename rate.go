@@ -31,7 +31,7 @@ type Limiter struct {
 //
 // The rate r is specified in events per second. If r <= 0, the Limiter
 // allows all events.
-func NewLimiter(r float64, b uint) *Limiter {
+func NewLimiter(r float64, b int) *Limiter {
 	var i time.Duration
 	if r > 0 {
 		i = time.Duration(float64(time.Second) / r)
@@ -51,8 +51,8 @@ func (l *Limiter) Allow() bool {
 
 // AllowN reports whether n events may happen at time t. Use this method if
 // you intend to drop/skip events that exceed the rate limit.
-func (l *Limiter) AllowN(t time.Time, n uint) bool {
-	if l.interval == 0 || n == 0 {
+func (l *Limiter) AllowN(t time.Time, n int) bool {
+	if l.interval == 0 || n <= 0 {
 		return true
 	}
 	for {
@@ -74,8 +74,8 @@ func (l *Limiter) Wait(ctx context.Context) error {
 
 // WaitN blocks until l permits n events to happen at time t. It returns an
 // error if the Context is canceled or the Context's deadline expired.
-func (l *Limiter) WaitN(ctx context.Context, t time.Time, n uint) error {
-	if l.interval == 0 || n == 0 {
+func (l *Limiter) WaitN(ctx context.Context, t time.Time, n int) error {
+	if l.interval == 0 || n <= 0 {
 		return nil
 	}
 	var d time.Duration
@@ -102,7 +102,7 @@ func (l *Limiter) WaitN(ctx context.Context, t time.Time, n uint) error {
 	}
 }
 
-func (l *Limiter) nextTat(t time.Time, tat int64, n uint) time.Time {
+func (l *Limiter) nextTat(t time.Time, tat int64, n int) time.Time {
 	nextTat := time.Unix(0, tat)
 	i := time.Duration(n) * l.interval
 	if t.After(nextTat) {

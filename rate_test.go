@@ -7,7 +7,6 @@ package rate_test
 import (
 	"context"
 	"math"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,7 +28,7 @@ var (
 
 type allow struct {
 	t  time.Time
-	n  uint
+	n  int
 	ok bool
 }
 
@@ -122,14 +121,8 @@ func TestSimultaneousRequests(t *testing.T) {
 }
 
 type testTime struct {
-	mu     sync.Mutex
-	cur    time.Time
-	timers []testTimer
-}
-
-type testTimer struct {
-	when time.Time
-	ch   chan<- time.Time
+	mu  sync.Mutex
+	cur time.Time
 }
 
 func (tt *testTime) now() time.Time {
@@ -147,19 +140,7 @@ func (tt *testTime) since(t time.Time) time.Duration {
 func (tt *testTime) advance(d time.Duration) {
 	tt.mu.Lock()
 	defer tt.mu.Unlock()
-	tt.advanceUnlocked(d)
-}
-
-func (tt *testTime) advanceUnlocked(d time.Duration) {
 	tt.cur = tt.cur.Add(d)
-	for i := 0; i < len(tt.timers); {
-		if tt.timers[i].when.After(tt.cur) {
-			i++
-			continue
-		}
-		tt.timers[i].ch <- tt.cur
-		tt.timers = slices.Delete(tt.timers, i, i+1)
-	}
 }
 
 func newTestTime() *testTime {
@@ -202,14 +183,117 @@ func TestLongRunningQPS(t *testing.T) {
 	}
 }
 
+type wait struct {
+	name   string
+	ctx    context.Context
+	n      int
+	delay  int // in multiples of d
+	nilErr bool
+}
+
+func runWait(t *testing.T, tt *testTime, l *rate.Limiter, w wait) {
+	t.Helper()
+	start := tt.now()
+	err := l.WaitN(w.ctx, start, w.n)
+	if w.n == 1 {
+		err = l.Wait(w.ctx)
+	}
+	tt.mu.Lock()
+	tt.cur = time.Now()
+	tt.mu.Unlock()
+	delay := tt.since(start)
+	if (w.nilErr && err != nil) || (!w.nilErr && err == nil) || !waitDelayOk(w.delay, delay) {
+		errString := "<nil>"
+		if !w.nilErr {
+			errString = "<non-nil error>"
+		}
+		t.Errorf("l.WaitN(%v, %v, %d) = %v with delay %v; want %v with delay %v (±%v)",
+			w.name, start, w.n, err, delay, errString, d*time.Duration(w.delay), d/2)
+	}
+}
+
+func waitDelayOk(wantD int, got time.Duration) bool {
+	// nearest multiple of the global constant d
+	gotD := int((got + (d / 2)) / d)
+	// The actual time spent waiting will be REDUCED by the amount of time spent
+	// since the last call to the limiter. We expect the time in between calls to
+	// be executing simple, straight-line, non-blocking code, so it should reduce
+	// the wait time by no more than half a d, which would round to exactly wantD.
+	if gotD < wantD {
+		return false
+	}
+	// The actual time spend waiting will be INCREASED by the amount of scheduling
+	// slop in the platform's sleep syscall, plus the amount of time spent executing
+	// straight-line code before measuring the elapsed duration.
+	//
+	// The latter is surely less than half a d, but the former is empirically
+	// sometimes larger on a number of platforms for a number of reasons.
+	// NetBSD and OpenBSD tend to overshoot sleeps by a wide margin due to a
+	// suspected platform bug; see https://go.dev/issue/44067 and
+	// https://go.dev/issue/50189.
+	// Longer delays were also also observed on slower builders with Linux kernels
+	// (linux-ppc64le-buildlet, android-amd64-emu), and on Solaris and Plan 9.
+	//
+	// Since d is already fairly generous, we take 150% of wantD rounded up —
+	// that's at least enough to account for the overruns we've seen so far in
+	// practice.
+	maxD := (wantD*3 + 1) / 2
+	return gotD <= maxD
+}
+
+func TestWaitSimple(t *testing.T) {
+	t.Parallel()
+	tt := newTestTime()
+	l := rate.NewLimiter(10, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runWait(t, tt, l, wait{"already-cancelled", ctx, 1, 0, false})
+	runWait(t, tt, l, wait{"act-now", context.Background(), 2, 0, true})
+	runWait(t, tt, l, wait{"act-later", context.Background(), 3, 2, true})
+}
+
+func TestWaitCancel(t *testing.T) {
+	t.Parallel()
+	tt := newTestTime()
+	l := rate.NewLimiter(10, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	runWait(t, tt, l, wait{"act-now", ctx, 2, 0, true})
+	go func() {
+		time.Sleep(d)
+		tt.mu.Lock()
+		tt.cur = time.Now()
+		tt.mu.Unlock()
+		cancel()
+	}()
+	runWait(t, tt, l, wait{"will-cancel", ctx, 3, 1, false})
+	runWait(t, tt, l, wait{"act-now-after-cancel", context.Background(), 2, 0, true})
+}
+
+func TestWaitTimeout(t *testing.T) {
+	t.Parallel()
+	tt := newTestTime()
+	l := rate.NewLimiter(10, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	runWait(t, tt, l, wait{"act-now", ctx, 2, 0, true})
+	runWait(t, tt, l, wait{"w-timeout-err", ctx, 3, 1, false})
+}
+
+func TestWaitInf(t *testing.T) {
+	t.Parallel()
+	tt := newTestTime()
+	l := rate.NewLimiter(math.MaxFloat64, 0)
+	runWait(t, tt, l, wait{"exceed-burst-no-error", context.Background(), 3, 0, true})
+}
+
 func TestZeroLimit(t *testing.T) {
 	t.Parallel()
 	var l rate.Limiter
 	if !l.Allow() {
 		t.Error("l.Allow() = false, want true")
 	}
-	if !l.AllowN(time.Now(), math.MaxUint32) {
-		t.Error("l.AllowN(time.Now(), math.MaxUint32) = false, want true")
+	if !l.AllowN(time.Now(), math.MaxInt32) {
+		t.Error("l.AllowN(time.Now(), math.MaxInt32) = false, want true")
 	}
 }
 
@@ -226,7 +310,7 @@ func BenchmarkAllowN(b *testing.B) {
 }
 
 func BenchmarkWaitNNoDelay(b *testing.B) {
-	l := rate.NewLimiter(float64(b.N), uint(b.N))
+	l := rate.NewLimiter(float64(b.N), b.N)
 	ctx := context.Background()
 	b.ReportAllocs()
 	b.ResetTimer()
